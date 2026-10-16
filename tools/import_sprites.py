@@ -1,4 +1,4 @@
-"""Convert the CC0 OpenGameArt assets into tray-sized PNG frames.
+"""Convert the CC0 OpenGameArt assets into tray-sized (128x128) PNG frames.
 
 Usage: python3 tools/import_sprites.py <download_dir>
 
@@ -11,9 +11,9 @@ import glob
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageSequence
+from PIL import Image, ImageFilter, ImageSequence
 
-SIZE = 64
+SIZE = 128  # the panel downscales to ~22px, so draw big and bold
 ROOT = Path(__file__).resolve().parent.parent / 'resources'
 
 
@@ -33,11 +33,12 @@ def load_dog(src):
     return [Image.open(d / f'Shepherd_run_{i}.png').convert('RGBA') for i in range(1, 6)]
 
 
-# name -> (loader, silhouette?)  silhouettes are recoloured per theme, others kept as is
+# name -> (loader, silhouette?, stroke thickening in px at SIZE)
+# silhouettes are recoloured per theme, others kept as is; thin strokes would vanish at tray size
 ANIMATIONS = {
-    'panther': (load_panther, True),
-    'stickman': (load_stickman, True),
-    'dog': (load_dog, False),
+    'panther': (load_panther, True, 5),
+    'stickman': (load_stickman, True, 5),
+    'dog': (load_dog, False, 0),
 }
 
 
@@ -52,15 +53,24 @@ def to_square(frames):
     box = common_bbox(frames)
     frames = [f.crop(box) for f in frames]
     w, h = frames[0].size
-    scale = (SIZE - 2) / max(w, h)
+    scale = SIZE / max(w, h)
     new = (max(1, round(w * scale)), max(1, round(h * scale)))
     out = []
     for f in frames:
-        f = f.resize(new, Image.NEAREST if min(w, h) < 100 else Image.LANCZOS)
+        f = f.resize(new, Image.BICUBIC)
         canvas = Image.new('RGBA', (SIZE, SIZE), (0, 0, 0, 0))
         canvas.paste(f, ((SIZE - new[0]) // 2, (SIZE - new[1]) // 2), f)
         out.append(canvas)
     return out
+
+
+def thicken(frame, px):
+    if not px:
+        return frame
+    alpha = frame.getchannel('A').filter(ImageFilter.MaxFilter(px | 1))
+    frame = frame.copy()
+    frame.putalpha(alpha)
+    return frame
 
 
 def recolor(frame, rgb):
@@ -70,8 +80,8 @@ def recolor(frame, rgb):
 
 
 def main(src):
-    for name, (loader, silhouette) in ANIMATIONS.items():
-        frames = to_square(loader(src))
+    for name, (loader, silhouette, px) in ANIMATIONS.items():
+        frames = [thicken(f, px) for f in to_square(loader(src))]
         out_dir = ROOT / name
         out_dir.mkdir(parents=True, exist_ok=True)
         for i, f in enumerate(frames):

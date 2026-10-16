@@ -16,8 +16,10 @@ The speed depends on your CPU usage.
 ./install.sh      # creates ./venv, installs deps, starts RunCat at every login
 ```
 
-On GNOME the tray icon needs the AppIndicator extension
-(`gnome-shell-extension-appindicator`). Remove autostart with `./uninstall.sh`.
+On GNOME (Wayland) the tray icon needs the AppIndicator extension and PyGObject:
+`sudo apt install gnome-shell-extension-appindicator python3-gi gir1.2-ayatanaappindicator3-0.1`.
+The venv is created with `--system-site-packages` so pystray can use them; without
+them pystray falls back to the X11 backend, whose menu does not work on Wayland. Remove autostart with `./uninstall.sh`.
 
 # Usage
 

@@ -1,5 +1,6 @@
 import bisect
 import fcntl
+import io
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from PIL import Image
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / 'config.json'
 RESOURCES_DIR = BASE_DIR / 'resources'
+CACHE_DIR = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'runcat' / 'icons'
 AUTOSTART_FILE = Path.home() / '.config' / 'autostart' / 'runcat.desktop'
 
 # CPU usage (%) thresholds and the frame interval (s) for each band.
@@ -61,6 +63,20 @@ def load_images(animation, dark_mode):
     return [Image.open(p).convert('RGBA') for p in paths]
 
 
+# 缓存帧文件 / Write the frames once to a stable cache dir and refer to them by icon name.
+# pystray's default (a new temp file per frame, deleted right after) races with the shell,
+# which loads indicator icons asynchronously and can end up showing a stale or empty icon.
+def cache_frames(animation, dark_mode):
+    prefix = 'dark' if dark_mode else 'light'
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for i, image in enumerate(load_images(animation, dark_mode)):
+        name = f'runcat_{animation}_{prefix}_{i}'
+        image.save(CACHE_DIR / f'{name}.png')
+        frames.append((name, image))
+    return frames
+
+
 def interval_for_cpu(cpu_usage, positive_correlation):
     # INTERVALS is slowest-first, so it already maps higher CPU -> faster (positive);
     # otherwise reverse it, as the original did.
@@ -74,10 +90,11 @@ class RunCat:
         self.animations = discover_animations()
         if self.settings['animation'] not in self.animations:
             self.settings['animation'] = self.animations[0]
-        self.images = load_images(self.settings['animation'], self.settings['dark_mode'])
+        self.frames = cache_frames(self.settings['animation'], self.settings['dark_mode'])
         self.interval = 1.0
         self.stop = threading.Event()
-        self.icon = pystray.Icon('RunCat_for_Linux', self.images[0], 'RunCat', self.build_menu())
+        self.chooser = None
+        self.icon = pystray.Icon('RunCat_for_Linux', self.frames[0][1], 'RunCat', self.build_menu())
 
     # --- background workers -------------------------------------------------
     def watch_cpu(self):
@@ -86,25 +103,30 @@ class RunCat:
             self.interval = interval_for_cpu(cpu, self.settings['positive_correlation'])
             self.icon.title = f'CPU {cpu:.0f}%'
 
+    def show_frame(self, name, image):
+        indicator = getattr(self.icon, '_appindicator', None)  # AppIndicator backend only
+        if indicator is None:
+            self.icon.icon = image
+            return
+        from gi.repository import GLib
+        GLib.idle_add(indicator.set_icon_full, name, 'RunCat')
+
     def animate(self):
+        indicator = getattr(self.icon, '_appindicator', None)
+        if indicator is not None:
+            from gi.repository import GLib
+            GLib.idle_add(indicator.set_icon_theme_path, str(CACHE_DIR))
         index = 0
         while not self.stop.is_set():
-            images = self.images
-            self.icon.icon = images[index % len(images)]
+            frames = self.frames
+            self.show_frame(*frames[index % len(frames)])
             index += 1
             self.stop.wait(self.interval)
 
     # --- menu ---------------------------------------------------------------
     def build_menu(self):
-        def animation_item(name):
-            return pystray.MenuItem(
-                name.replace('_', ' ').title(),
-                lambda icon, item: self.set_animation(name),
-                checked=lambda item: self.settings['animation'] == name,
-                radio=True)
-
         return pystray.Menu(
-            pystray.MenuItem('Animation', pystray.Menu(*[animation_item(n) for n in self.animations])),
+            pystray.MenuItem('Choose animation…', self.open_chooser, default=True),
             pystray.MenuItem('White icon (dark panel)', self.toggle_dark_mode,
                              checked=lambda item: self.settings['dark_mode']),
             pystray.MenuItem('Faster with higher CPU', self.toggle_correlation,
@@ -114,8 +136,82 @@ class RunCat:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Quit', self.quit))
 
+    # 动画选择窗口 / GTK window: a select on the left, an animated preview on the right
+    def open_chooser(self, icon, item):
+        try:
+            import gi
+            gi.require_version('Gtk', '3.0')
+            from gi.repository import GdkPixbuf, GLib, Gtk
+        except (ImportError, ValueError):
+            return  # GTK not available
+
+        def to_pixbuf(frame):
+            # neutral background so both white and black silhouettes stay visible
+            shade = 70 if self.settings['dark_mode'] else 200
+            bg = Image.new('RGBA', frame.size, (shade, shade, shade, 255))
+            bg.alpha_composite(frame)
+            data = io.BytesIO()
+            bg.resize((96, 96), Image.BICUBIC).save(data, 'PNG')
+            loader = GdkPixbuf.PixbufLoader.new_with_type('png')
+            loader.write(data.getvalue())
+            loader.close()
+            return loader.get_pixbuf()
+
+        def build():
+            if self.chooser is not None:
+                self.chooser.present()
+                return False
+            window = Gtk.Window(title='RunCat')
+            window.set_position(Gtk.WindowPosition.MOUSE)
+            window.set_resizable(False)
+            window.set_keep_above(True)
+            box = Gtk.Box(spacing=12)
+            box.set_border_width(12)
+            window.add(box)
+
+            combo = Gtk.ComboBoxText()
+            for name in self.animations:
+                combo.append(name, name.replace('_', ' ').title())
+            combo.set_valign(Gtk.Align.CENTER)
+            preview = Gtk.Image()
+            box.pack_start(combo, False, False, 0)
+            box.pack_start(preview, False, False, 0)
+
+            state = {'pixbufs': [], 'index': 0, 'timer': None}
+
+            def tick():
+                state['index'] = (state['index'] + 1) % len(state['pixbufs'])
+                preview.set_from_pixbuf(state['pixbufs'][state['index']])
+                return True
+
+            def on_changed(widget):
+                name = widget.get_active_id()
+                if name != self.settings['animation']:
+                    self.set_animation(name)
+                state['pixbufs'] = [to_pixbuf(f) for f in load_images(name, self.settings['dark_mode'])]
+                state['index'] = 0
+                preview.set_from_pixbuf(state['pixbufs'][0])
+                if state['timer'] is None:
+                    state['timer'] = GLib.timeout_add(120, tick)
+
+            def on_destroy(_w):
+                if state['timer'] is not None:
+                    GLib.source_remove(state['timer'])
+                self.chooser = None
+
+            combo.connect('changed', on_changed)
+            window.connect('destroy', on_destroy)
+            window.connect('key-press-event',
+                           lambda w, e: w.destroy() if e.keyval == 0xff1b else None)  # Esc
+            self.chooser = window
+            combo.set_active_id(self.settings['animation'])
+            window.show_all()
+            return False
+
+        GLib.idle_add(build)  # build GTK widgets inside the GTK main loop
+
     def reload_images(self):
-        self.images = load_images(self.settings['animation'], self.settings['dark_mode'])
+        self.frames = cache_frames(self.settings['animation'], self.settings['dark_mode'])
         save_config(self.settings)
 
     def set_animation(self, name):
