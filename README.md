@@ -13,31 +13,40 @@ The speed depends on your CPU usage.
 # Installation
 
 ```bash
-pip3 install -r requirements.txt
+./install.sh      # creates ./venv, installs deps, starts RunCat at every login
 ```
+
+On GNOME the tray icon needs the AppIndicator extension
+(`gnome-shell-extension-appindicator`). Remove autostart with `./uninstall.sh`.
 
 # Usage
 
 ```bash
-python3 main.py
+nohup venv/bin/python main.py >/dev/null 2>&1 &   # run in background
 ```
 
-# Configuration
+Right-click the tray icon to choose the animation, switch icon colour, invert
+the speed/CPU relation, toggle "Start at login" or quit. Choices are saved in
+`config.json`. Only one instance runs at a time.
 
-You can set cat icon color, speed in `config.json`.
+# Configuration
 
 ```json
 {
     "settings": {
-        // true for dark mode, using white cat icon
-        "dark_mode": true,
-        /* cat speed relative to cpu usage, 
-        true means the HIGHER cpu usage, 
-        the FASTER cat runs*/
-        "positive_correlation" : false
+        "dark_mode": true,             // true = white icons (dark panel)
+        "positive_correlation": false, // true = higher CPU -> faster animation
+        "animation": "cat"             // any folder in resources/
     }
 }
 ```
+
+# Adding animations
+
+Put frames in `resources/<name>/` named `dark_<name>_0.png`, `light_<name>_0.png`,
+`dark_<name>_1.png`, ... (.ico or .png). They show up in the menu automatically.
+`tools/import_sprites.py` shows how the bundled panther, stickman and dog were
+generated. Sprite credits are in [CREDITS.md](CREDITS.md).
 
 # Acknowledgements
 

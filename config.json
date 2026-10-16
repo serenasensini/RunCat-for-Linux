@@ -1,6 +1,7 @@
 {
     "settings": {
         "dark_mode": true,
-        "positive_correlation" : false
+        "positive_correlation": false,
+        "animation": "cat"
     }
 }

@@ -1,89 +1,172 @@
-import time
-import pystray
-import psutil
-import threading
+import bisect
+import fcntl
 import json
+import os
+import re
+import sys
+import threading
 from pathlib import Path
+
+import psutil
+import pystray
 from PIL import Image
 
-# 从配置文件中读取设置
-# Read settings from the configuration file
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / 'config.json'
+RESOURCES_DIR = BASE_DIR / 'resources'
+AUTOSTART_FILE = Path.home() / '.config' / 'autostart' / 'runcat.desktop'
+
+# CPU usage (%) thresholds and the frame interval (s) for each band.
+# Above the last threshold the animation runs at the fastest speed.
+CPU_THRESHOLDS = [10.0, 20.0, 40.0, 60.0]
+INTERVALS = [0.5, 0.3, 0.2, 0.1, 0.07]
+
+DEFAULT_SETTINGS = {
+    'dark_mode': True,
+    'positive_correlation': False,
+    'animation': 'cat',
+}
+
+
+# 读取配置 / Load settings, filling in defaults for missing keys
 def load_config():
-    with open('config.json', 'r') as file:
-        config = json.load(file)
-    return config['settings']['dark_mode'], config['settings']['positive_correlation']
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(CONFIG_PATH, 'r') as file:
+            settings.update(json.load(file).get('settings', {}))
+    except (OSError, ValueError):
+        pass
+    return settings
 
-# 设置前缀字符串和时间间隔列表(s)
-# Set the prefix string and interval list
-def get_interval_list(dark_mode, positive_correlation):
-    prefix_string = 'dark' if dark_mode else 'light'
-    interval_list = [0.5, 0.3, 0.2, 0.1, 0.07]
-    if not positive_correlation:
-        interval_list.reverse()
-    return prefix_string, interval_list
 
-# 读取所有图像文件
-# Read all icon files
-def load_images(prefix_string):
-    image_paths = [Path(f'./resources/cat/{prefix_string}_cat_{i}.ico') for i in range(5)]
-    return [Image.open(image_path) for image_path in image_paths]
+def save_config(settings):
+    with open(CONFIG_PATH, 'w') as file:
+        json.dump({'settings': settings}, file, indent=4)
 
-# 获取 CPU 使用率并更新间隔
-# Get CPU usage and update interval
-def get_cpu_usage(interval_list, update_interval):
-    while True:
-        cpu_usage = psutil.cpu_percent(interval=1)
-        if cpu_usage < 10.0:
-            update_interval[0] = interval_list[0]
-        elif 10.0 <= cpu_usage < 20.0:
-            update_interval[0] = interval_list[1]
-        elif 20.0 <= cpu_usage < 40.0:
-            update_interval[0] = interval_list[2]
-        elif 40.0 <= cpu_usage < 60.0:
-            update_interval[0] = interval_list[3]
-        elif 60.0 <= cpu_usage < 80.0:
-            update_interval[0] = interval_list[4]
 
-# 更新托盘图标
-# Update tray icon
-def update_icon(icon, images, update_interval):
-    index = 0
-    while True:
-        icon.icon = images[index]
-        index = (index + 1) % len(images)
-        time.sleep(update_interval[0])
+# 扫描 resources/ 下的动画 / Discover animations: resources/<name>/<theme>_<name>_<i>.(ico|png)
+def discover_animations():
+    names = []
+    for folder in sorted(RESOURCES_DIR.iterdir()):
+        if folder.is_dir() and list(folder.glob(f'dark_{folder.name}_*')):
+            names.append(folder.name)
+    return names
 
-# 设置托盘图标
-# Setup tray icon
-def setup_tray_icon(images, update_interval):
-    tray = pystray.Icon("RunCat_for_Linux")
-    tray.icon = images[0]
 
-    # 启动一个线程来更新图标
-    # Start a thread to update the icon
-    threading.Thread(target=update_icon, args=(tray, images, update_interval), daemon=True).start()
+def load_images(animation, dark_mode):
+    prefix = 'dark' if dark_mode else 'light'
+    folder = RESOURCES_DIR / animation
+    paths = [p for p in folder.glob(f'{prefix}_{animation}_*') if p.suffix in ('.ico', '.png')]
+    paths.sort(key=lambda p: int(re.search(r'_(\d+)\.\w+$', p.name).group(1)))
+    return [Image.open(p).convert('RGBA') for p in paths]
 
-    # 运行托盘图标
-    # Run the tray icon
-    tray.run()
+
+def interval_for_cpu(cpu_usage, positive_correlation):
+    # INTERVALS is slowest-first, so it already maps higher CPU -> faster (positive);
+    # otherwise reverse it, as the original did.
+    intervals = INTERVALS if positive_correlation else INTERVALS[::-1]
+    return intervals[bisect.bisect_right(CPU_THRESHOLDS, cpu_usage)]
+
+
+class RunCat:
+    def __init__(self):
+        self.settings = load_config()
+        self.animations = discover_animations()
+        if self.settings['animation'] not in self.animations:
+            self.settings['animation'] = self.animations[0]
+        self.images = load_images(self.settings['animation'], self.settings['dark_mode'])
+        self.interval = 1.0
+        self.stop = threading.Event()
+        self.icon = pystray.Icon('RunCat_for_Linux', self.images[0], 'RunCat', self.build_menu())
+
+    # --- background workers -------------------------------------------------
+    def watch_cpu(self):
+        while not self.stop.is_set():
+            cpu = psutil.cpu_percent(interval=1)
+            self.interval = interval_for_cpu(cpu, self.settings['positive_correlation'])
+            self.icon.title = f'CPU {cpu:.0f}%'
+
+    def animate(self):
+        index = 0
+        while not self.stop.is_set():
+            images = self.images
+            self.icon.icon = images[index % len(images)]
+            index += 1
+            self.stop.wait(self.interval)
+
+    # --- menu ---------------------------------------------------------------
+    def build_menu(self):
+        def animation_item(name):
+            return pystray.MenuItem(
+                name.replace('_', ' ').title(),
+                lambda icon, item: self.set_animation(name),
+                checked=lambda item: self.settings['animation'] == name,
+                radio=True)
+
+        return pystray.Menu(
+            pystray.MenuItem('Animation', pystray.Menu(*[animation_item(n) for n in self.animations])),
+            pystray.MenuItem('White icon (dark panel)', self.toggle_dark_mode,
+                             checked=lambda item: self.settings['dark_mode']),
+            pystray.MenuItem('Faster with higher CPU', self.toggle_correlation,
+                             checked=lambda item: self.settings['positive_correlation']),
+            pystray.MenuItem('Start at login', self.toggle_autostart,
+                             checked=lambda item: AUTOSTART_FILE.exists()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Quit', self.quit))
+
+    def reload_images(self):
+        self.images = load_images(self.settings['animation'], self.settings['dark_mode'])
+        save_config(self.settings)
+
+    def set_animation(self, name):
+        self.settings['animation'] = name
+        self.reload_images()
+
+    def toggle_dark_mode(self, icon, item):
+        self.settings['dark_mode'] = not self.settings['dark_mode']
+        self.reload_images()
+
+    def toggle_correlation(self, icon, item):
+        self.settings['positive_correlation'] = not self.settings['positive_correlation']
+        save_config(self.settings)
+
+    def toggle_autostart(self, icon, item):
+        if AUTOSTART_FILE.exists():
+            AUTOSTART_FILE.unlink()
+        else:
+            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART_FILE.write_text(
+                '[Desktop Entry]\nType=Application\nName=RunCat for Linux\n'
+                f'Exec="{sys.executable}" "{BASE_DIR / "main.py"}"\n'
+                'Icon=utilities-system-monitor\nX-GNOME-Autostart-enabled=true\n'
+                'X-GNOME-Autostart-Delay=5\n')
+
+    def quit(self, icon, item):
+        self.stop.set()
+        icon.stop()
+
+    def run(self):
+        threading.Thread(target=self.watch_cpu, daemon=True).start()
+        threading.Thread(target=self.animate, daemon=True).start()
+        self.icon.run()
+
+
+# 单实例锁 / Allow only one running instance
+def acquire_single_instance_lock():
+    lock_dir = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp'))
+    lock_file = open(lock_dir / 'runcat_for_linux.lock', 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit('RunCat is already running.')
+    return lock_file
+
 
 def main():
-    dark_mode, positive_correlation = load_config()
-    prefix_string, interval_list = get_interval_list(dark_mode, positive_correlation)
-    images = load_images(prefix_string)
+    lock = acquire_single_instance_lock()  # keep a reference so the lock is held
+    RunCat().run()
+    del lock
 
-    # 共享变量
-    # Shared variables
-    update_interval = [1.0]
 
-    # 启动一个线程来获取 CPU 使用率
-    # Start a thread to get CPU usage
-    cpu_thread = threading.Thread(target=get_cpu_usage, args=(interval_list, update_interval), daemon=True)
-    cpu_thread.start()
-
-    # 显示状态栏图标
-    # Show the status bar icon
-    setup_tray_icon(images, update_interval)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
